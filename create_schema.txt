@@ -1,0 +1,218 @@
+-- Issue a pre-emptive rollback (to discard the effect of any active transaction) --
+rollback;
+
+-- If the tables/functions already exist, delete them --
+drop table if exists airports cascade;
+drop table if exists aircraft cascade;
+drop table if exists flights cascade;
+drop table if exists passengers cascade;
+drop table if exists reservations;
+
+drop function if exists iata_code_upper();
+drop function if exists add_reservation_for_existing_passenger();
+drop function if exists ignore_airport_duplicates();
+drop function if exists ignore_aircraft_duplicates();
+drop function if exists ignore_flight_duplicates();
+drop function if exists ignore_reservation_duplicates();
+drop function if exists delete_error_if_dne();
+drop function if exists prevent_deletion_if_reservation_exists();
+drop function if exists check_both_international();
+drop function if exists check_flight_capacity();
+drop function if exists check_aircraft_capacity();
+
+-- Create all tables with relevant constraints --
+create table airports(
+	iata_code char(3) primary key,
+	name varchar(255) not null,
+	country varchar(255) not null,
+	is_international boolean not null,
+	check(length(iata_code) > 0),
+	check(length(name) > 0),
+	check(length(country) > 0)
+);
+
+create table aircraft(
+	id varchar(64) primary key,
+	airline varchar(255) not null,
+	model_name varchar(255) not null,
+	capacity integer not null,
+	check(length(id) > 0),
+	check(length(airline) > 0),
+	check(length(model_name) > 0),
+	check(capacity > 0)
+);
+
+create table flights(
+	id integer primary key,
+	airline varchar(255) not null,
+	source char(3) not null,
+	destination char(3) not null,
+	departure timestamp not null,
+	arrival timestamp not null,
+	aircraft varchar(64) not null,	
+	check(source <> destination),
+	check(arrival <= now()),
+	check(departure <= now()), 
+	check(extract(epoch from arrival) > extract(epoch from departure)), 
+	foreign key (source) references airports(iata_code) 
+		on delete restrict 
+		on update restrict 
+		deferrable,
+	foreign key (destination) references airports(iata_code) 
+		on delete restrict 
+		on update cascade  
+		deferrable,
+	foreign key (aircraft) references aircraft(id) 
+		on delete restrict
+		on update cascade 
+		deferrable
+);
+
+create table passengers(
+	id integer primary key,
+	name varchar(1000) not null,  
+	check(length(name) > 0)
+);
+
+create table reservations(
+	flight_id integer not null,
+	passenger_id integer not null,
+	primary key(flight_id, passenger_id), 
+	foreign key (flight_id) references flights(id) 
+		on delete restrict 
+		on update cascade  
+		deferrable, 
+	foreign key (passenger_id) references passengers(id) 
+		on delete restrict 
+		on update cascade 
+		deferrable 
+);
+
+-- Trigger definitions --
+create function iata_code_upper()
+returns trigger as
+$BODY$
+begin
+	new.iata_code = upper(new.iata_code);
+	return new;
+end
+$BODY$
+language plpgsql;
+
+create trigger iata_code_upper_constraint 
+	before insert or update on airports  
+	for each row 
+	execute procedure iata_code_upper();
+	
+create function add_reservation_for_existing_passenger() 
+returns trigger as 
+$BODY$
+begin
+	if (select count(*) from passengers where id = new.id) > 0 
+	then 
+		return null;
+	end if;
+	return new;
+end
+$BODY$
+language plpgsql;
+
+create trigger add_reservation 
+	before insert on passengers  
+	for each row 
+	execute procedure add_reservation_for_existing_passenger();
+
+create function ignore_airport_duplicates() 
+returns trigger as 
+$BODY$
+begin
+	if (select count(*) from airports where iata_code = new.iata_code) > 0 
+	then 
+		return null;
+	end if;
+	return new;
+end
+$BODY$
+language plpgsql;
+
+create trigger ignore_airports  
+	before insert on airports  
+	for each row 
+	execute procedure ignore_airport_duplicates();
+
+create function ignore_aircraft_duplicates()
+returns trigger as 
+$BODY$
+begin
+	if (select count(*) from aircraft where id = new.id) > 0 
+	then 
+		return null;
+	end if;
+	return new;
+end
+$BODY$
+language plpgsql;
+
+create trigger ignore_aircraft 
+	before insert on aircraft 
+	for each row 
+	execute procedure ignore_aircraft_duplicates();
+
+create function ignore_flight_duplicates()
+returns trigger as 
+$BODY$
+begin
+	if (select count(*) from flights where id = new.id) > 0 
+	then 
+		return null;
+	end if;
+	return new;
+end
+$BODY$
+language plpgsql;
+
+create trigger ignore_flight 
+	before insert on flights  
+	for each row 
+	execute procedure ignore_flight_duplicates();
+
+create function ignore_reservation_duplicates()
+returns trigger as 
+$BODY$
+begin
+	if (select count(*) from reservations where flight_id = new.flight_id and passenger_id = new.passenger_id) > 0 
+	then 
+		return null;
+	end if;
+	return new;
+end
+$BODY$
+language plpgsql;
+
+create trigger ignore_reservation 
+	before insert on reservations 
+	for each row 
+	execute procedure ignore_reservation_duplicates();
+
+create function check_both_international() 
+returns trigger as 
+$BODY$
+begin
+	if(select country from airports where iata_code = new.source) <> (select country from airports where iata_code = new.destination)
+	then
+		if(select is_international from airports where iata_code = new.source) and (select is_international from airports where iata_code = new.destination) 
+	then
+		return new;
+	else
+		raise exception 'International flights can only fly between international airports.';
+	end if;
+	end if;
+	return new;
+end
+$BODY$
+language plpgsql;
+
+create trigger both_international 
+	after insert or update on flights 
+	for each row 
+	execute procedure check_both_international();
